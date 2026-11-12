@@ -47,6 +47,7 @@ final class Accessories: ObservableObject, @unchecked Sendable {
         // Synapse may put its own colours back on a wake; ours go back on after it.
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                self?.rescan() // reopen an accessory whose attach was interrupted by sleep
                 for accessory in self?.connected ?? [] { accessory.reapplyOverSynapse() }
             }
         })
@@ -58,7 +59,9 @@ final class Accessories: ObservableObject, @unchecked Sendable {
     /// `reapply: false` after a failed write, so an accessory that keeps refusing can't loop
     /// write → rescan → reapply → write.
     func rescan(reapply: Bool = true) {
+        guard !DeviceIOGate.shared.isSuspended else { return }
         scanQueue.async { [weak self] in
+            guard !DeviceIOGate.shared.isSuspended else { return }
             let found = HIDDevice.accessoryControlInterfaces().compactMap { device -> FoundAccessory? in
                 guard let info = RazerAccessories.info(pid: HIDDevice.productID(of: device)) else { return nil }
                 return FoundAccessory(id: .init(pid: info.pid, locationID: HIDDevice.locationID(of: device)),
@@ -71,6 +74,7 @@ final class Accessories: ObservableObject, @unchecked Sendable {
     /// Main thread. Keeps the controller of a unit still plugged in (its pending writes and
     /// all), makes one for a new unit, and lets go of the rest.
     private func apply(_ found: [FoundAccessory], reapply: Bool) {
+        guard !DeviceIOGate.shared.isSuspended else { return }
         let existing = Dictionary(uniqueKeysWithValues: connected.map { ($0.id, $0) })
         let next = found.map { unit -> AccessoryController in
             let accessory = existing[unit.id] ?? makeController(unit.id, unit.info)
@@ -239,6 +243,8 @@ final class AccessoryController: ObservableObject, Identifiable, @unchecked Send
             var brightness: UInt8?
             do {
                 brightness = try self.readBrightness(device)
+            } catch HIDDevice.HIDError.systemSleeping {
+                return // suspension is not evidence of a stale accessory handle
             } catch HIDDevice.HIDError.commandFailed, HIDDevice.HIDError.notSupported {
                 // It answered and refused: the handle is fine.
             } catch where !isNew {
@@ -385,6 +391,9 @@ final class AccessoryController: ObservableObject, Identifiable, @unchecked Send
                     _ = try device.sendWithRetry(RazerCommands.setBrightness(raw, led: info.brightnessLed),
                                                  attempts: HIDDevice.defaultAttempts, transactionId: info.transactionId)
                 }
+            } catch HIDDevice.HIDError.systemSleeping {
+                self.publish { self.pending.finish(token) }
+                return
             } catch {
                 failure = error
             }

@@ -27,9 +27,11 @@ extension HIDDevice: RazerTransport {
 /// The retry ladder both transports share, so a policy change can't drift between them.
 /// Falls through to the last error.
 enum RazerRetry {
-    static func run<T>(attempts: Int, _ body: () throws -> T) throws -> T {
+    static func run<T>(attempts: Int, gate: DeviceIOGate = .shared, _ body: () throws -> T) throws -> T {
         var lastError: Error = HIDDevice.HIDError.timeout
+        let session = gate.session
         for attempt in 0..<attempts {
+            try gate.check(session: session)
             do {
                 return try body()
             } catch HIDDevice.HIDError.notSupported {
@@ -39,6 +41,8 @@ enum RazerRetry {
             } catch HIDDevice.HIDError.notFound {
                 // The device is gone (a Bluetooth link dropped); only a reopen can help.
                 throw HIDDevice.HIDError.notFound
+            } catch HIDDevice.HIDError.systemSleeping {
+                throw HIDDevice.HIDError.systemSleeping
             } catch {
                 lastError = error
                 // No backoff after the final attempt: it would only delay reporting the

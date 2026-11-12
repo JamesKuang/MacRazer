@@ -241,6 +241,12 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// quietly stop reflecting the mouse.
     var userWorkPendingForTesting: Bool { userWorkPending }
     func runUserCommandForTesting(_ body: @escaping @Sendable () -> Void) { userCommand(body) }
+    func installTransportForTesting(_ transport: any RazerTransport) {
+        io.sync { device = transport }
+    }
+    func waitForIOForTesting() { io.sync {} }
+    var pollScheduledForTesting: Bool { pollTimer != nil }
+    var settingsPollScheduledForTesting: Bool { settingsTimer != nil }
     #endif
 
     private func beginUserWork() {
@@ -263,6 +269,8 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         return now.timeIntervalSince(lastFailure) < bluetoothRetryInterval
     }
     private var pollTimer: Timer?
+    /// Main-thread lifecycle state. The gate also protects queued/in-flight USB work.
+    private var systemSleeping = false
     private var history = BatteryHistory(deviceKey: "default")
     private var cycleHistory = ChargeCycleHistory(deviceKey: "default")
     private var historyKey: String? // device the current history belongs to
@@ -322,7 +330,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         // A device test holds the mouse, and the Bluetooth test has let go of the app's own
         // connection on purpose: reopening it now would leave the test's reads unanswered.
         // `endDeviceTest` reads everything again, which does the recovery's job.
-        guard !deviceTestActive else { return }
+        guard !deviceTestActive, !systemSleeping else { return }
         let generation = beginWakeRecoveryGeneration()
         if !connected { update(\.bluetoothRecoveryState, .reconnecting) }
         io.async { [weak self] in
@@ -398,19 +406,48 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         refreshAll()
         scheduleNextPoll(after: BatteryPollStateMachine.Cadence.settling)
         // The history and curve files are written on a throttle, and a Mac that sleeps and
-        // then loses power never reaches `applicationWillTerminate`. Save on the way down.
+        // then loses power never reaches `applicationWillTerminate`. Save on the way down,
+        // and stop device traffic before it can wake the Mac during the sleep transition.
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.saveHistorySoon() }
+        ) { [weak self] _ in self?.systemWillSleep() }
         // Sleep is where a mouse most often disappears: switched off, or its dongle moved to
         // another machine. The poll may be minutes away by then, so ask as soon as we're up.
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.beginWakeRecovery() }
+        ) { [weak self] _ in self?.systemDidWake() }
     }
 
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
+
+    func systemWillSleep() {
+        systemSleeping = true
+        DeviceIOGate.shared.suspend()
+        FileHandle.standardError.write(Data("[MacRazer] system sleep: USB requests paused\n".utf8))
+        _ = beginWakeRecoveryGeneration() // invalidate delayed recovery attempts
+        pollTimer?.invalidate()
+        pollTimer = nil
+        settingsTimer?.invalidate()
+        settingsTimer = nil
+        inputWatcher.stop()
+        isRefreshing = false
+        io.async { [weak self] in
+            self?.device?.close()
+            self?.device = nil
+            self?.knownSerial = nil
+            self?.bluetoothOpenFailedAt = nil
+        }
+        saveHistorySoon()
+    }
+
+    func systemDidWake() {
+        DeviceIOGate.shared.resume()
+        systemSleeping = false
+        FileHandle.standardError.write(Data("[MacRazer] system wake: resuming device checks\n".utf8))
+        beginWakeRecovery()
+        if popoverVisible { setPopoverVisible(true) }
+    }
 
     /// Writes the throttled history and curve out without waiting. The Mac is going to sleep
     /// either way; if the queue is mid-read this lands a moment later, or on wake.
@@ -454,7 +491,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         pollTimer?.invalidate()
         // A poll already on the device queue when a test began still lands here when it
         // finishes. `endDeviceTest` restarts the loop.
-        guard !deviceTestActive else { pollTimer = nil; return }
+        guard !deviceTestActive, !systemSleeping else { pollTimer = nil; return }
         let t = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
             self?.pollTick()
         }
@@ -503,7 +540,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
 
     /// Settings (DPI + polling) only — no spinner. Call on the main thread.
     func refreshSettings() {
-        guard !settingsReadQueued, !deviceTestActive else { return }
+        guard !settingsReadQueued, !deviceTestActive, !systemSleeping else { return }
         settingsReadQueued = true
         io.async { [weak self] in
             guard let self else { return }
@@ -520,7 +557,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         popoverVisible = visible
         settingsTimer?.invalidate()
         settingsTimer = nil
-        guard visible, !deviceTestActive else { return }
+        guard visible, !deviceTestActive, !systemSleeping else { return }
         // While the mouse is unreachable the poll backs off, so a mouse woken just before
         // opening the popover could otherwise still read offline. Looking is a good moment
         // to check.
@@ -538,6 +575,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// `immediateOffline` so the disconnect shows at once (bypassing the timeout debounce,
     /// since a USB termination is definitive). Also realigns the poll cadence.
     func forceCheck(immediateOffline: Bool) {
+        guard !systemSleeping else { return }
         io.async { [weak self] in
             guard let self else { return }
             // A plug event is the only way a different unit can turn up on an interface we
@@ -588,7 +626,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         guard cableRechecksLeft > 0 else { return }
         cableRechecksLeft -= 1
         io.asyncAfter(deadline: .now() + Self.cableRecheckDelay) { [weak self] in
-            guard let self, !self.deviceTestActiveForIO else { return }
+            guard let self, !self.deviceTestActiveForIO, !DeviceIOGate.shared.isSuspended else { return }
             self.releaseDeviceIfOutranked()
             if self.device == nil { self.checkNow(immediateOffline: false) }
         }
@@ -612,7 +650,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// calls while one check is pending are dropped, so clicking away at a button that isn't
     /// answering can't pile reads up on the serial queue.
     func checkIfOffline() {
-        guard !connected, !offlineCheckQueued else { return }
+        guard !connected, !offlineCheckQueued, !systemSleeping else { return }
         offlineCheckQueued = true
         io.async { [weak self] in
             guard let self else { return }
@@ -644,7 +682,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// Full refresh (battery + settings) with the spinner — used by the refresh button.
     /// Re-reads DPI/poll so on-mouse changes (e.g. middle-button DPI cycling) show up.
     func refreshAll() {
-        guard !deviceTestActive else { return }
+        guard !deviceTestActive, !systemSleeping else { return }
         publish { self.isRefreshing = true }
         io.async { [weak self] in
             guard let self else { return }
@@ -660,6 +698,8 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// Runs on `io`. Performs the HID reads, feeds the outcome to `pollState` (where every
     /// decision rule lives — see `BatteryPollStateMachine`), and acts on the verdict.
     private func readBatterySync(immediateOffline: Bool = false) {
+        let session = DeviceIOGate.shared.session
+        guard !DeviceIOGate.shared.isSuspended else { return }
         let outcome: BatteryPollStateMachine.ReadOutcome
         var errText: String?
         /// The charging flag as the device reported it this tick, or nil when the charging
@@ -713,6 +753,8 @@ final class MouseController: ObservableObject, @unchecked Sendable {
                 let charging = observedCharging ?? false
                 outcome = .battery(raw: raw, charging: charging)
             }
+        } catch HIDDevice.HIDError.systemSleeping {
+            return // a system sleep is not a mouse disconnect
         } catch {
             releaseDeviceIfNeeded(after: error)
             errText = String(describing: error)
@@ -721,18 +763,19 @@ final class MouseController: ObservableObject, @unchecked Sendable {
             outcome = .failure(deviceGone: gone)
         }
 
+        guard DeviceIOGate.shared.isCurrent(session: session) else { return }
         switch pollState.handle(outcome, immediateOffline: immediateOffline) {
         case .aliveNoBattery:
             // A battery-less (wired) mouse can't be charging — without this the menu bar
             // bolt survives a swap from a charging wireless mouse and never clears.
-            publishConnected {
+            publishConnected(session: session) {
                 self.update(\.batteryPercent, nil)
                 self.update(\.charging, false)
             }
 
         case .notReady:
             // Keep the last known value on screen; the fast poll cadence retries shortly.
-            publishConnected {}
+            publishConnected(session: session) {}
 
         case .reading(let pct, let isCharging, let recordSample):
             if recordSample { history.record(percent: pct, charging: isCharging) }
@@ -753,7 +796,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
             let estimate = isCharging ? "Charging" : snapshot.estimateText
             let snap = historySnapshot()
             let chargingNow = observedCharging // immutable capture for the @Sendable publish block
-            publishConnected {
+            publishConnected(session: session) {
                 // A real reading proves the mouse is responding again — a stale "couldn't
                 // apply" banner would now be lying (polls clear it within ~15s of a wake).
                 self.update(\.profileApplyFailed, false)
@@ -791,11 +834,12 @@ final class MouseController: ObservableObject, @unchecked Sendable {
             }
             let err = errText
             publish {
+                guard DeviceIOGate.shared.isCurrent(session: session) else { return }
                 let wasConnected = self.connected
                 self.update(\.connected, false)
                 // Nothing on the USB side will say when a mouse behind its dongle wakes up,
                 // but the mouse itself will, the moment it moves.
-                self.inputWatcher.start()
+                if !self.systemSleeping { self.inputWatcher.start() }
                 // An unreachable mouse isn't charging as far as we know — leaving this set
                 // strands the menu bar bolt on (dimmed) indefinitely after a disconnect.
                 self.update(\.charging, false)
@@ -828,8 +872,9 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// Main-queue publish shared by every "device is reachable" verdict: the connection
     /// flag, error reset, first-baseline and connect-sound handling. `alsoSet` runs inside
     /// the same block, before the status text refresh.
-    private func publishConnected(alsoSet: @escaping @Sendable () -> Void) {
+    private func publishConnected(session: UInt64, alsoSet: @escaping @Sendable () -> Void) {
         publish {
+            guard DeviceIOGate.shared.isCurrent(session: session) else { return }
             let wasConnected = self.connected
             self.update(\.connected, true)
             self.update(\.bluetoothRecoveryState, .idle)
@@ -874,13 +919,15 @@ final class MouseController: ObservableObject, @unchecked Sendable {
     /// ladders against a dead link would occupy the serial queue for seconds and delay any
     /// queued user write. Battery refresh surfaces connection errors; this can fail quietly.
     private func readSettingsSync() {
+        let session = DeviceIOGate.shared.session
         guard let dev = try? ensureDevice() else { return }
         var linkDead = false
         func read<T>(_ report: RazerReport, _ parse: (RazerReport) -> T) -> T? {
             // Stand down the moment a tap is waiting. Whatever is skipped here is read again
             // by the next poll, and a stale DPI reading for two seconds costs less than a
             // slider that does nothing for a second.
-            guard !linkDead, !self.userWorkPending else { return nil }
+            guard !linkDead, !self.userWorkPending,
+                  DeviceIOGate.shared.isCurrent(session: session) else { return nil }
             do { return parse(try dev.sendWithRetry(report)) }
             catch HIDDevice.HIDError.commandFailed, HIDDevice.HIDError.notSupported {
                 return nil // this feature only — the device answered, keep reading others
@@ -914,12 +961,14 @@ final class MouseController: ObservableObject, @unchecked Sendable {
         let sleep: Int? = {
             guard RazerDevices.supportsSleepTimeout(pid: dev.productID),
                   let bluetooth = dev as? BluetoothDevice,
-                  !linkDead, !self.userWorkPending else { return nil }
+                  !linkDead, !self.userWorkPending,
+                  DeviceIOGate.shared.isCurrent(session: session) else { return nil }
             do { return try bluetooth.readSleepTimeout() }
             catch HIDDevice.HIDError.timeout { linkDead = true; return nil }
             catch { return nil }
         }()
         publish {
+            guard DeviceIOGate.shared.isCurrent(session: session) else { return }
             if let d { self.update(\.dpi, d) }
             if let p {
                 self.update(\.pollRate, p)
@@ -1919,6 +1968,7 @@ final class MouseController: ObservableObject, @unchecked Sendable {
 
     /// Must be called on `io`.
     private func ensureDevice() throws -> any RazerTransport {
+        if DeviceIOGate.shared.isSuspended { throw HIDDevice.HIDError.systemSleeping }
         if let d = device { return d }
         let d = try openTransport()
         device = d

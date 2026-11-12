@@ -25,6 +25,7 @@ final class HIDDevice {
         case timeout
         case commandFailed
         case notSupported
+        case systemSleeping
 
         var description: String {
             func hex(_ r: IOReturn) -> String { String(format: "0x%08x", UInt32(bitPattern: r)) }
@@ -37,6 +38,7 @@ final class HIDDevice {
             case .timeout: return "Device command timed out (known-finicky over the wireless dongle)"
             case .commandFailed: return "Device reported the command failed (status 0x03)"
             case .notSupported: return "Device reports the command as not supported (status 0x05)"
+            case .systemSleeping: return "Device communication paused for system sleep"
             }
         }
     }
@@ -388,7 +390,9 @@ final class HIDDevice {
         // stderr, not stdout: this fires on every (re)open inside the GUI app too, and the
         // CLI's actual output goes to stdout.
         FileHandle.standardError.write(Data("[MacRazer] \(role): \(describe(chosen))\n".utf8))
-        let openResult = IOHIDDeviceOpen(chosen, IOOptionBits(kIOHIDOptionsTypeNone))
+        let openResult = try DeviceIOGate.shared.perform {
+            IOHIDDeviceOpen(chosen, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
         guard openResult == kIOReturnSuccess else { throw HIDError.openFailed(openResult) }
         return HIDDevice(device: chosen)
     }
@@ -408,6 +412,8 @@ final class HIDDevice {
     /// `transactionId` overrides the registry's for this one command. Only the device test
     /// passes one, to find which id an unknown model answers to; everything else passes nil.
     func send(_ report: RazerReport, transactionId: UInt8?) throws -> RazerReport {
+        let session = DeviceIOGate.shared.session
+        try DeviceIOGate.shared.check(session: session)
         var report = report
         // Per-model (and per-command-class) transaction id from the registry, stamped at
         // the single point every command passes through — the builders in `RazerCommands`
@@ -415,8 +421,10 @@ final class HIDDevice {
         report.transactionId = transactionId ?? RazerDevices.transactionId(
             pid: productID, commandClass: report.commandClass, commandId: report.commandId)
         let out = report.serialized()
-        let setResult = out.withUnsafeBufferPointer { ptr in
-            IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 0, ptr.baseAddress!, ptr.count)
+        let setResult = try DeviceIOGate.shared.perform(session: session) {
+            out.withUnsafeBufferPointer { ptr in
+                IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 0, ptr.baseAddress!, ptr.count)
+            }
         }
         guard setResult == kIOReturnSuccess else { throw HIDError.setReportFailed(setResult) }
 
@@ -428,8 +436,10 @@ final class HIDDevice {
         for busyAttempt in 0..<5 {
             var inBuf = [UInt8](repeating: 0, count: RazerReport.wireSize)
             var inLen = inBuf.count
-            let getResult = inBuf.withUnsafeMutableBufferPointer { ptr in
-                IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 0, ptr.baseAddress!, &inLen)
+            let getResult = try DeviceIOGate.shared.perform(session: session) {
+                inBuf.withUnsafeMutableBufferPointer { ptr in
+                    IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 0, ptr.baseAddress!, &inLen)
+                }
             }
             guard getResult == kIOReturnSuccess else { throw HIDError.getReportFailed(getResult) }
             // A short transfer leaves the pre-zeroed buffer parsing as an all-zeros

@@ -44,6 +44,9 @@ expect rough edges until 1.0.
   show up in its report.
 
 ### Fixed
+- **USB device checks during Mac sleep.** Pause polling and USB requests before system
+  sleep, release the mouse connection, and reconnect on wake. Device checks could otherwise
+  generate HID activity during the sleep transition and turn the display back on.
 - **Brightness on the Goliathus Chroma Extended.** It answers brightness on a different light
   than MacRazer used, so the slider did nothing.
 - **250 Hz polling is read correctly.** A mouse left at 250 Hz showed no rate, and the device
